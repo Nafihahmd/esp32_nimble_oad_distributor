@@ -1,5 +1,11 @@
 menu "Example Configuration"
 
+    config EXAMPLE_LOCAL_NAME
+        string "Local Name"
+        default "dual_image_app"
+        help
+            Enter the local name to be advertised in the example
+
     config EXAMPLE_PEER_ADDR
         string "Peer Address"
         default "ADDR_ANY"

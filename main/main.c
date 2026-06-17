@@ -17,6 +17,9 @@
  * under the License.
  */
 
+#include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include "esp_log.h"
 #include "nvs_flash.h"
 /* BLE */
@@ -479,6 +482,69 @@ blecent_scan(void)
 }
 
 /**
+ * @brief Get Complete local name from advertisement data
+ * 
+ * @param data Advertisement data
+ * @param data_len Advertisement data length
+ * @param name Buffer to store the complete local name
+ * @param name_size Size of the buffer to store the complete local name
+ */
+bool get_complete_local_name(const uint8_t *data,
+                             uint8_t data_len,
+                             char *name,
+                             size_t name_size)
+{
+    uint8_t offset = 0;
+    ESP_LOGI(tag, "Searching for Complete Local Name in advertisement data");
+
+    while (offset < data_len) {
+
+        uint8_t len = data[offset];
+
+        if (len == 0) {
+            break;
+        }
+
+        /* Ensure AD structure is within bounds */
+        if ((offset + len) >= data_len) {
+            ESP_LOGI(tag, "Advertisement data is corrupted");
+            return false;
+        }
+
+        uint8_t ad_type = data[offset + 1];
+        ESP_LOGI(tag, "AD Type=0x%02X, Length=%d", ad_type, len);
+
+        printf("AD Data: ");
+        for (int i = 0; i < len - 1; i++) {
+            printf("0x%02X ", data[offset + 2 + i]);
+        }
+        printf("\n");
+
+        /* Complete Local Name */
+        if (ad_type == 0x09) {
+            ESP_LOGI(tag, "Complete Local Name found in advertisement data");
+
+            uint8_t name_len = len - 1;
+
+            if (name_len >= name_size) {
+                name_len = name_size - 1;
+            }
+
+            memcpy(name,
+                   &data[offset + 2],
+                   name_len);
+
+            name[name_len] = '\0';
+
+            return true;
+        }
+
+        offset += len + 1;
+    }
+
+    return false;
+}
+/**
  * Indicates whether we should try to connect to the sender of the specified
  * advertisement.  The function returns a positive result if the device
  * advertises connectability and support for the Alert Notification service.
@@ -494,6 +560,7 @@ ext_blecent_should_connect(const struct ble_gap_ext_disc_desc *disc)
 #endif // CONFIG_EXAMPLE_USE_CI_ADDRESS
     uint8_t test_addr[6];
     uint32_t peer_addr[6];
+    char local_name[32];
 
     memset(peer_addr, 0x0, sizeof peer_addr);
 
@@ -536,12 +603,21 @@ ext_blecent_should_connect(const struct ble_gap_ext_disc_desc *disc)
             break;
         }
 
-	/* Search if ANS UUID is advertised */
-        if (disc->data[offset] == 0x03 && disc->data[offset + 1] == 0x03) {
-            if ( disc->data[offset + 2] == 0x18 && disc->data[offset + 3] == 0x11 ) {
+        /* Search for local name */        
+        if (get_complete_local_name(disc->data, disc->length_data, local_name, sizeof(local_name))) {
+            ESP_LOGI(tag, "Complete Local Name: %s", local_name);
+        }
+
+        if (strncmp(local_name, CONFIG_EXAMPLE_LOCAL_NAME, strlen(CONFIG_EXAMPLE_LOCAL_NAME)) == 0) {
+            ESP_LOGI(tag, "Local name match target name: %s", CONFIG_EXAMPLE_LOCAL_NAME);
                 return 1;
             }
-        }
+	/* Search if ANS UUID is advertised */
+        // if (disc->data[offset] == 0x03 && disc->data[offset + 1] == 0x03) {
+        //     if ( disc->data[offset + 2] == 0x18 && disc->data[offset + 3] == 0x11 ) {
+        //         return 1;
+        //     }
+        // }
 
         offset += ad_struct_len + 1;
 
@@ -692,31 +768,6 @@ static void blecent_power_control(uint16_t conn_handle)
     assert (rc == 0);
 }
 #endif
-/**
- * @brief Custom function to print exytended advertising fields
- * @param fields: pointer to the ble_hs_adv_fields structure
- * 
- * @return void
- */
-
- void print_adv_fields_custom(struct ble_hs_adv_fields *fields)
- {
-     int i;
-     ESP_LOGI(tag, "Advertisement fields:");
-     ESP_LOGI(tag, "  Device Name: %.*s", fields->name_len, fields->name);
-    //  ESP_LOGI(tag, " RSSI: %d", fields->rssi);
-     ESP_LOGI(tag, "  Address: %s", fields->device_addr);
-    //  ESP_LOGI(tag, "  Service UUIDs:");
-    //  for (i = 0; i < fields->num_uuids16; i++) {
-    //      ESP_LOGI(tag, "    %04x", ble_uuid_u16(&fields->uuids16[i].u));
-    //  }
-    //  for (i = 0; i < fields->num_uuids32; i++) {
-    //      ESP_LOGI(tag, "    %08lx", ble_uuid_u32(&fields->uuids32[i].u));
-    //  }
-    //  for (i = 0; i < fields->num_uuids128; i++) {
-    //      ESP_LOGI(tag, "    %s", ble_uuid_to_str(&fields->uuids128[i].u));
-    //  }
- }
 
 /**
  * The nimble host executes this callback when a GAP event occurs.  The
@@ -760,17 +811,6 @@ blecent_gap_event(struct ble_gap_event *event, void *arg)
 
         /* Try to connect to the advertiser if it looks interesting. */
         blecent_connect_if_interesting(&event->disc);
-
-        /* Print Scanned result */
-        /* already done by print_adv_fields() */
-        // printf("Device: ");
-        // print_addr(event->disc.addr.val);
-
-        // printf(" RSSI=%d",
-        //        event->disc.rssi);
-
-        // printf(" Type=%d\n",
-        //        event->disc.addr.type);
 
         return 0;
 #if NIMBLE_BLE_CONNECT
@@ -935,21 +975,14 @@ blecent_gap_event(struct ble_gap_event *event, void *arg)
 #if CONFIG_EXAMPLE_EXTENDED_ADV
     case BLE_GAP_EVENT_EXT_DISC:
         /* An advertisement report was received during GAP discovery. */
-        ESP_LOGI(tag, "Received extended adv report");
-        rc = ble_hs_adv_parse_fields(&fields, event->ext_disc.data,
-                                     event->ext_disc.length_data);
-        if (rc != 0) {
-            ESP_LOGE(tag, "Failed to parse extended adv data; rc=%d\n", rc);
-            return 0;
-        }
-        // ESP_LOGI(tag, "Extended Adv report parsed successfully");
-
+        /* Filter devices by RSSI */
+        if (event->ext_disc.rssi > -50){
         ESP_LOGI(tag, "Device: %s , RSSI: %d", addr_str(event->ext_disc.addr.val), event->ext_disc.rssi);
-        ESP_LOGI(tag, "Advertising data: %s", event->ext_disc.data);
-        // print_adv_fields_custom(&fields);
+
         ext_print_adv_report(&event->ext_disc);
 
         blecent_connect_if_interesting(&event->ext_disc);
+        }
         return 0;
 #endif
 
