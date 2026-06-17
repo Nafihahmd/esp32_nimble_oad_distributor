@@ -434,7 +434,44 @@ blecent_on_disc_complete(const struct peer *peer, int status, void *arg)
     /* Now perform three GATT procedures against the peer: read,
      * write, and subscribe to notifications for the ANS service.
      */
-    blecent_read_write_subscribe(peer);
+    // blecent_read_write_subscribe(peer);
+    /* List all discovered services, characteristics, and descriptors */
+    const struct peer_svc *svc;
+    const struct peer_chr *chr;
+    const struct peer_dsc *dsc;
+    char buf[BLE_UUID_STR_LEN];
+
+    SLIST_FOREACH(svc, &peer->svcs, next) {
+
+        MODLOG_DFLT(INFO, "SERVICE");
+        ble_uuid_to_str(&svc->svc.uuid.u, buf);
+
+        MODLOG_DFLT(INFO,
+                    "SERVICE uuid=%s start=%d end=%d",
+                    buf,
+                    svc->svc.start_handle,
+                    svc->svc.end_handle);
+
+        SLIST_FOREACH(chr, &svc->chrs, next) {
+            ble_uuid_to_str(&chr->chr.uuid.u, buf);
+
+            MODLOG_DFLT(INFO,
+                        "  CHAR uuid=%s val=%d def=%d props=0x%02x",
+                        buf,
+                        chr->chr.val_handle,
+                        chr->chr.def_handle,
+                        chr->chr.properties);
+
+            SLIST_FOREACH(dsc, &chr->dscs, next) {
+                ble_uuid_to_str(&dsc->dsc.uuid.u, buf);
+
+                MODLOG_DFLT(INFO,
+                            "    DSC uuid=%s handle=%d",
+                            buf,
+                            dsc->dsc.handle);;
+            }
+        }
+    }
 }
 #endif  //MYNEWT_VAL(BLE_GATTC)
 
