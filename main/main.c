@@ -33,6 +33,8 @@
 #if MYNEWT_VAL(BLE_GATT_CACHING)
 #include "host/ble_esp_gattc_cache.h"
 #endif
+/* OAD */
+#include "ble_oad.h"
 
 #if CONFIG_EXAMPLE_USE_CI_ADDRESS
 #ifdef CONFIG_IDF_TARGET_ESP32
@@ -78,335 +80,242 @@ static uint16_t bearers;
 
 void ble_store_config_init(void);
 
+//-------------------------------------------------
+// Global variables and definitions
+//-------------------------------------------------
+uint8_t image_identify[] = {
+    0x3D,0xB8,0xF3,0x96,
+    0x00,0x00,0x00,0x00,
+    0x00,0x01,
+    0x00,0x00,
+    0x00,0xB0,0x03,0x00,
+    0x00,0x00,0x00,0x00,
+    0x02,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00
+};
+/**
+ * Send OAD start command to target. The target will respond
+ * by requesting block number.
+ */
+static void send_start_oad(uint16_t conn_handle)
+{
+    const struct peer *peer = peer_find(conn_handle);
+    const struct peer_chr *ctrl_chr;
+
+    ctrl_chr = peer_chr_find_uuid(peer,
+                                  &oad_service_uuid.u,
+                                  &oad_ctrl_uuid.u);
+
+    if (ctrl_chr == NULL) {
+        ESP_LOGE(tag, "OAD Control characteristic not found");
+        return;
+    }
+
+    uint8_t cmd = CMD_START_OAD;
+
+    ESP_LOGI(tag, "Sending START_OAD");
+
+    int rc = ble_gattc_write_no_rsp_flat(conn_handle,
+                                         ctrl_chr->chr.val_handle,
+                                         &cmd,
+                                         sizeof(cmd));
+
+    if (rc != 0) {
+        ESP_LOGE(tag,
+                 "Failed to send START_OAD rc=%d",
+                 rc);
+    }
+}
+/**
+ * Send Image identification payload to target
+ */
+static void send_image_identify(uint16_t conn_handle)
+{
+    const struct peer *peer = peer_find(conn_handle);
+    const struct peer_chr *img_chr;
+
+    img_chr = peer_chr_find_uuid(peer,
+                                 &oad_service_uuid.u,
+                                 &oad_img_uuid.u);
+
+    if (img_chr == NULL) {
+        ESP_LOGE(tag, "OAD Image Identify characteristic not found");
+        return;
+    }
+
+    ESP_LOGI(tag, "Sending Image Identify");
+    ESP_LOG_BUFFER_HEX(tag,
+                       image_identify,
+                       sizeof(image_identify));
+
+    int rc = ble_gattc_write_flat(conn_handle,
+                                  img_chr->chr.val_handle,
+                                  image_identify,
+                                  sizeof(image_identify),
+                                  NULL,
+                                  NULL);
+
+    if (rc != 0) {
+        ESP_LOGE(tag,
+                 "Failed to send Image Identify rc=%d",
+                 rc);
+    }
+}
+/**
+ * Handle Block request send by Target
+ */
+static void handle_block_request(uint8_t *data, uint16_t len)
+{
+    uint8_t status = data[1];
+
+    if (status != 0) {
+        ESP_LOGW(tag,
+                 "Target rejected previous block status=%u",
+                 status);
+
+        return;
+    }
+
+    uint32_t block_num =
+          ((uint32_t)data[2])
+        | ((uint32_t)data[3] << 8)
+        | ((uint32_t)data[4] << 16)
+        | ((uint32_t)data[5] << 24);
+
+    ESP_LOGI(tag,
+             "Request Block %lu",
+             (unsigned long)block_num);
+
+    // send_oad_block(block_num);
+}
 #if MYNEWT_VAL(BLE_GATTC)
-/**
- * Application Callback. Called when the custom subscribable chatacteristic
- * in the remote GATT server is read.
- * Expect to get the recently written data.
- **/
 static int
-blecent_on_custom_read(uint16_t conn_handle,
-                       const struct ble_gatt_error *error,
-                       struct ble_gatt_attr *attr,
-                       void *arg)
-{
-    MODLOG_DFLT(INFO,
-                "Read complete for the subscribable characteristic; "
-                "status=%d conn_handle=%d", error->status, conn_handle);
-    if (error->status == 0) {
-        MODLOG_DFLT(INFO, " attr_handle=%d value=", attr->handle);
-        print_mbuf(attr->om);
-    }
-    MODLOG_DFLT(INFO, "\n");
-
-    return 0;
-}
-
-/**
- * Application Callback. Called when the custom subscribable characteristic
- * in the remote GATT server is written to.
- * Client has previously subscribed to this characeteristic,
- * so expect a notification from the server.
- **/
-static int
-blecent_on_custom_write(uint16_t conn_handle,
-                        const struct ble_gatt_error *error,
-                        struct ble_gatt_attr *attr,
-                        void *arg)
-{
-    const struct peer_chr *chr;
-    const struct peer *peer;
-    int rc;
-
-    MODLOG_DFLT(INFO,
-                "Write to the custom subscribable characteristic complete; "
-                "status=%d conn_handle=%d attr_handle=%d\n",
-                error->status, conn_handle, attr->handle);
-
-    peer = peer_find(conn_handle);
-    chr = peer_chr_find_uuid(peer,
-                             remote_svc_uuid,
-                             remote_chr_uuid);
-    if (chr == NULL) {
-        MODLOG_DFLT(ERROR,
-                    "Error: Peer doesn't have the custom subscribable characteristic\n");
-        goto err;
-    }
-
-    /*** Performs a read on the characteristic, the result is handled in blecent_on_new_read callback ***/
-    rc = ble_gattc_read(conn_handle, chr->chr.val_handle,
-                        blecent_on_custom_read, NULL);
-    if (rc != 0) {
-        MODLOG_DFLT(ERROR,
-                    "Error: Failed to read the custom subscribable characteristic; "
-                    "rc=%d\n", rc);
-        goto err;
-    }
-
-    return 0;
-err:
-    /* Terminate the connection */
-    return ble_gap_terminate(peer->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-}
-
-/**
- * Application Callback. Called when the custom subscribable characteristic
- * is subscribed to.
- **/
-static int
-blecent_on_custom_subscribe(uint16_t conn_handle,
-                            const struct ble_gatt_error *error,
-                            struct ble_gatt_attr *attr,
-                            void *arg)
-{
-    const struct peer_chr *chr;
-    uint8_t value;
-    int rc;
-    const struct peer *peer;
-
-    MODLOG_DFLT(INFO,
-                "Subscribe to the custom subscribable characteristic complete; "
-                "status=%d conn_handle=%d", error->status, conn_handle);
-
-    if (error->status == 0) {
-        MODLOG_DFLT(INFO, " attr_handle=%d value=", attr->handle);
-        print_mbuf(attr->om);
-    }
-    MODLOG_DFLT(INFO, "\n");
-
-    peer = peer_find(conn_handle);
-    chr = peer_chr_find_uuid(peer,
-                             remote_svc_uuid,
-                             remote_chr_uuid);
-    if (chr == NULL) {
-        MODLOG_DFLT(ERROR, "Error: Peer doesn't have the subscribable characteristic\n");
-        goto err;
-    }
-
-    /* Write 1 byte to the new characteristic to test if it notifies after subscribing */
-    value = 0x19;
-    rc = ble_gattc_write_flat(conn_handle, chr->chr.val_handle,
-                              &value, sizeof(value), blecent_on_custom_write, NULL);
-    if (rc != 0) {
-        MODLOG_DFLT(ERROR,
-                    "Error: Failed to write to the subscribable characteristic; "
-                    "rc=%d\n", rc);
-        goto err;
-    }
-
-    return 0;
-err:
-    /* Terminate the connection */
-    return ble_gap_terminate(peer->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-}
-
-/**
- * Performs 3 operations on the remote GATT server.
- * 1. Subscribes to a characteristic by writing 0x10 to it's CCCD.
- * 2. Writes to the characteristic and expect a notification from remote.
- * 3. Reads the characteristic and expect to get the recently written information.
- **/
-static void
-blecent_custom_gatt_operations(const struct peer* peer)
-{
-    const struct peer_dsc *dsc;
-    int rc;
-    uint8_t value[2];
-
-    dsc = peer_dsc_find_uuid(peer,
-                             remote_svc_uuid,
-                             remote_chr_uuid,
-                             BLE_UUID16_DECLARE(BLE_GATT_DSC_CLT_CFG_UUID16));
-    if (dsc == NULL) {
-        MODLOG_DFLT(ERROR, "Error: Peer lacks a CCCD for the subscribable characteristic\n");
-        goto err;
-    }
-
-    /*** Write 0x00 and 0x01 (The subscription code) to the CCCD ***/
-    value[0] = 1;
-    value[1] = 0;
-    rc = ble_gattc_write_flat(peer->conn_handle, dsc->dsc.handle,
-                              value, sizeof(value), blecent_on_custom_subscribe, NULL);
-    if (rc != 0) {
-        MODLOG_DFLT(ERROR,
-                    "Error: Failed to subscribe to the subscribable characteristic; "
-                    "rc=%d\n", rc);
-        goto err;
-    }
-
-    return;
-err:
-    /* Terminate the connection */
-    ble_gap_terminate(peer->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-}
-
-/**
- * Application callback.  Called when the attempt to subscribe to notifications
- * for the ANS Unread Alert Status characteristic has completed.
- */
-static int
-blecent_on_subscribe(uint16_t conn_handle,
+oad_on_mtu_exchanged(uint16_t conn_handle,
                      const struct ble_gatt_error *error,
-                     struct ble_gatt_attr *attr,
-                     void *arg)
+                     uint16_t mtu, void *arg)
 {
-    struct peer *peer;
+    ESP_LOGI(tag, "MTU exchange complete: status=%d mtu=%d", error->status, mtu);
 
-    MODLOG_DFLT(INFO, "Subscribe complete; status=%d conn_handle=%d "
-                "attr_handle=%d\n",
-                error->status, conn_handle, attr->handle);
-
-    peer = peer_find(conn_handle);
-    if (peer == NULL) {
-        MODLOG_DFLT(ERROR, "Error in finding peer, aborting...");
+    if (error->status != 0) {
+        MODLOG_DFLT(ERROR, "MTU exchange failed, aborting\n");
         ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return 0;
     }
-    /* Subscribe to, write to, and read the custom characteristic*/
-    blecent_custom_gatt_operations(peer);
 
+    /* Now we can safely send GET_BLOCK_SIZE */
+    const struct peer *peer = peer_find(conn_handle);
+    const struct peer_chr *ctrl_chr = peer_chr_find_uuid(peer,
+                                       &oad_service_uuid.u,
+                                       &oad_ctrl_uuid.u);
+    uint8_t get_block_size = 0x01;
+    int rc = ble_gattc_write_flat(conn_handle, ctrl_chr->chr.val_handle,
+                                  &get_block_size, sizeof(get_block_size),
+                                  NULL, NULL);
+    if (rc != 0) {
+        MODLOG_DFLT(ERROR, "Error: Failed to write GET_BLOCK_SIZE; rc=%d\n", rc);
+    }
+    g_oad_state = OAD_STATE_WAIT_BLOCK_SIZE;
     return 0;
 }
 
-/**
- * Application callback.  Called when the write to the ANS Alert Notification
- * Control Point characteristic has completed.
- */
-static int
-blecent_on_write(uint16_t conn_handle,
-                 const struct ble_gatt_error *error,
-                 struct ble_gatt_attr *attr,
-                 void *arg)
+static int oad_cccd_write_cb(uint16_t conn_handle,
+                             const struct ble_gatt_error *error,
+                             struct ble_gatt_attr *attr,
+                             void *arg)
 {
-    MODLOG_DFLT(INFO,
-                "Write complete; status=%d conn_handle=%d attr_handle=%d\n",
-                error->status, conn_handle, attr->handle);
+    const struct peer_dsc *img_dsc, *ctrl_dsc;
+    const struct peer *peer = peer_find(conn_handle);
+    ESP_LOGI(tag, "CCCD write complete status=%d handle=%d",
+             error->status, attr ? attr->handle : 0);
 
-    /* Subscribe to notifications for the Unread Alert Status characteristic.
-     * A central enables notifications by writing two bytes (1, 0) to the
-     * characteristic's client-characteristic-configuration-descriptor (CCCD).
-     */
+    if (error->status != 0) {
+        MODLOG_DFLT(ERROR, "CCCD write failed, aborting\n");
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return 0;
+    }
+    
+    img_dsc = peer_dsc_find_uuid(peer, &oad_service_uuid.u, &oad_img_uuid.u,
+                                 BLE_UUID16_DECLARE(BLE_GATT_DSC_CLT_CFG_UUID16));
+    ctrl_dsc = peer_dsc_find_uuid(peer, &oad_service_uuid.u, &oad_ctrl_uuid.u,
+                                  BLE_UUID16_DECLARE(BLE_GATT_DSC_CLT_CFG_UUID16));
+    /* CCCD writes succeeded, now exchange MTU */
+    int rc = ble_gattc_exchange_mtu(conn_handle, oad_on_mtu_exchanged, NULL);
+    if (rc != 0) {
+        MODLOG_DFLT(ERROR, "Error: Failed to request MTU exchange; rc=%d\n", rc);
+    }
+    return 0;
+}
+
+static int ble_oad_client_enable_notifications_2(uint16_t conn_handle,
+                             const struct ble_gatt_error *error,
+                             struct ble_gatt_attr *attr,
+                             void *arg)
+{
     const struct peer_dsc *dsc;
     uint8_t value[2];
     int rc;
     const struct peer *peer = peer_find(conn_handle);
 
-    dsc = peer_dsc_find_uuid(peer,
-                             BLE_UUID16_DECLARE(BLECENT_SVC_ALERT_UUID),
-                             BLE_UUID16_DECLARE(BLECENT_CHR_UNR_ALERT_STAT_UUID),
-                             BLE_UUID16_DECLARE(BLE_GATT_DSC_CLT_CFG_UUID16));
-    if (dsc == NULL) {
-        MODLOG_DFLT(ERROR, "Error: Peer lacks a CCCD for the Unread Alert "
-                    "Status characteristic\n");
-        goto err;
-    }
+    ESP_LOGI(tag,
+             "CCCD write complete status=%d handle=%d",
+             error->status,
+             attr ? attr->handle : 0);
+    
+             
+    dsc = peer_dsc_find_uuid(peer, &oad_service_uuid.u, &oad_ctrl_uuid.u,
+                                  BLE_UUID16_DECLARE(BLE_GATT_DSC_CLT_CFG_UUID16));
 
+    
     value[0] = 1;
     value[1] = 0;
-    rc = ble_gattc_write_flat(conn_handle, dsc->dsc.handle,
-                              value, sizeof value, blecent_on_subscribe, NULL);
+    rc = ble_gattc_write_flat(peer->conn_handle, dsc->dsc.handle,
+                              value, sizeof value, oad_cccd_write_cb, NULL);
     if (rc != 0) {
         MODLOG_DFLT(ERROR, "Error: Failed to subscribe to characteristic; "
                     "rc=%d\n", rc);
         goto err;
     }
-
     return 0;
-err:
-    /* Terminate the connection. */
-    return ble_gap_terminate(peer->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+
+    err:
+        ble_gap_terminate(peer->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return 0;
 }
-
 /**
- * Application callback.  Called when the read of the ANS Supported New Alert
- * Category characteristic has completed.
- */
-static int
-blecent_on_read(uint16_t conn_handle,
-                const struct ble_gatt_error *error,
-                struct ble_gatt_attr *attr,
-                void *arg)
-{
-    MODLOG_DFLT(INFO, "Read complete; status=%d conn_handle=%d", error->status,
-                conn_handle);
-    if (error->status == 0) {
-        MODLOG_DFLT(INFO, " attr_handle=%d value=", attr->handle);
-        print_mbuf(attr->om);
-    }
-    MODLOG_DFLT(INFO, "\n");
-
-    /* Write two bytes (99, 100) to the alert-notification-control-point
-     * characteristic.
-     */
-    const struct peer_chr *chr;
-    uint8_t value[2];
-    int rc;
-    const struct peer *peer = peer_find(conn_handle);
-
-    chr = peer_chr_find_uuid(peer,
-                             BLE_UUID16_DECLARE(BLECENT_SVC_ALERT_UUID),
-                             BLE_UUID16_DECLARE(BLECENT_CHR_ALERT_NOT_CTRL_PT));
-    if (chr == NULL) {
-        MODLOG_DFLT(ERROR, "Error: Peer doesn't support the Alert "
-                    "Notification Control Point characteristic\n");
-        goto err;
-    }
-
-    value[0] = 99;
-    value[1] = 100;
-    rc = ble_gattc_write_flat(conn_handle, chr->chr.val_handle,
-                              value, sizeof value, blecent_on_write, NULL);
-    if (rc != 0) {
-        MODLOG_DFLT(ERROR, "Error: Failed to write characteristic; rc=%d\n",
-                    rc);
-        goto err;
-    }
-
-    return 0;
-err:
-    /* Terminate the connection. */
-    return ble_gap_terminate(peer->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-}
-
-/**
- * Performs three GATT operations against the specified peer:
- * 1. Reads the ANS Supported New Alert Category characteristic.
- * 2. After read is completed, writes the ANS Alert Notification Control Point characteristic.
- * 3. After write is completed, subscribes to notifications for the ANS Unread Alert Status
- *    characteristic.
- *
+ * Enables notifications for the OAD service.
  * If the peer does not support a required service, characteristic, or
- * descriptor, then the peer lied when it claimed support for the alert
- * notification service!  When this happens, or if a GATT procedure fails,
+ * descriptor, then the peer lied when it claimed support for the OAD
+ * service!  When this happens, or if a GATT procedure fails,
  * this function immediately terminates the connection.
  */
-static void
-blecent_read_write_subscribe(const struct peer *peer)
-{
-    const struct peer_chr *chr;
+static void ble_oad_client_enable_notifications(const struct peer *peer)
+{    
+    const struct peer_dsc *dsc;
+    uint8_t value[2];
     int rc;
+    dsc = peer_dsc_find_uuid(peer, &oad_service_uuid.u, &oad_img_uuid.u,
+                                    BLE_UUID16_DECLARE(BLE_GATT_DSC_CLT_CFG_UUID16));
 
-    /* Read the supported-new-alert-category characteristic. */
-    chr = peer_chr_find_uuid(peer,
-                             BLE_UUID16_DECLARE(BLECENT_SVC_ALERT_UUID),
-                             BLE_UUID16_DECLARE(BLECENT_CHR_SUP_NEW_ALERT_CAT_UUID));
-    if (chr == NULL) {
-        MODLOG_DFLT(ERROR, "Error: Peer doesn't support the Supported New "
-                    "Alert Category characteristic\n");
+    if (dsc == NULL) {
+        MODLOG_DFLT(ERROR, "Error: Peer doesn't support the OAD service\n");
         goto err;
     }
 
-    rc = ble_gattc_read(peer->conn_handle, chr->chr.val_handle,
-                        blecent_on_read, NULL);
+    value[0] = 1;
+    value[1] = 0;
+    rc = ble_gattc_write_flat(peer->conn_handle, dsc->dsc.handle,
+                              value, sizeof value, ble_oad_client_enable_notifications_2, NULL);
     if (rc != 0) {
-        MODLOG_DFLT(ERROR, "Error: Failed to read characteristic; rc=%d\n",
-                    rc);
+        MODLOG_DFLT(ERROR, "Error: Failed to subscribe to characteristic; "
+                    "rc=%d\n", rc);
         goto err;
     }
-
     return;
-err:
-    /* Terminate the connection. */
-    ble_gap_terminate(peer->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+
+    err:
+        ble_gap_terminate(peer->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
 }
 
 /**
@@ -435,43 +344,8 @@ blecent_on_disc_complete(const struct peer *peer, int status, void *arg)
      * write, and subscribe to notifications for the ANS service.
      */
     // blecent_read_write_subscribe(peer);
-    /* List all discovered services, characteristics, and descriptors */
-    const struct peer_svc *svc;
-    const struct peer_chr *chr;
-    const struct peer_dsc *dsc;
-    char buf[BLE_UUID_STR_LEN];
-
-    SLIST_FOREACH(svc, &peer->svcs, next) {
-
-        MODLOG_DFLT(INFO, "SERVICE");
-        ble_uuid_to_str(&svc->svc.uuid.u, buf);
-
-        MODLOG_DFLT(INFO,
-                    "SERVICE uuid=%s start=%d end=%d",
-                    buf,
-                    svc->svc.start_handle,
-                    svc->svc.end_handle);
-
-        SLIST_FOREACH(chr, &svc->chrs, next) {
-            ble_uuid_to_str(&chr->chr.uuid.u, buf);
-
-            MODLOG_DFLT(INFO,
-                        "  CHAR uuid=%s val=%d def=%d props=0x%02x",
-                        buf,
-                        chr->chr.val_handle,
-                        chr->chr.def_handle,
-                        chr->chr.properties);
-
-            SLIST_FOREACH(dsc, &chr->dscs, next) {
-                ble_uuid_to_str(&dsc->dsc.uuid.u, buf);
-
-                MODLOG_DFLT(INFO,
-                            "    DSC uuid=%s handle=%d",
-                            buf,
-                            dsc->dsc.handle);;
-            }
-        }
-    }
+    /* Enable notifications for the OAD service */
+    ble_oad_client_enable_notifications(peer);
 }
 #endif  //MYNEWT_VAL(BLE_GATTC)
 
@@ -532,7 +406,7 @@ bool get_complete_local_name(const uint8_t *data,
                              size_t name_size)
 {
     uint8_t offset = 0;
-    ESP_LOGI(tag, "Searching for Complete Local Name in advertisement data");
+    ESP_LOGD(tag, "Searching for Complete Local Name in advertisement data");
 
     while (offset < data_len) {
 
@@ -544,22 +418,15 @@ bool get_complete_local_name(const uint8_t *data,
 
         /* Ensure AD structure is within bounds */
         if ((offset + len) >= data_len) {
-            ESP_LOGI(tag, "Advertisement data is corrupted");
+            ESP_LOGD(tag, "Advertisement data is corrupted");
             return false;
         }
 
         uint8_t ad_type = data[offset + 1];
-        ESP_LOGI(tag, "AD Type=0x%02X, Length=%d", ad_type, len);
-
-        printf("AD Data: ");
-        for (int i = 0; i < len - 1; i++) {
-            printf("0x%02X ", data[offset + 2 + i]);
-        }
-        printf("\n");
 
         /* Complete Local Name */
         if (ad_type == 0x09) {
-            ESP_LOGI(tag, "Complete Local Name found in advertisement data");
+            ESP_LOGD(tag, "Complete Local Name found in advertisement data");
 
             uint8_t name_len = len - 1;
 
@@ -630,35 +497,36 @@ ext_blecent_should_connect(const struct ble_gap_ext_disc_desc *disc)
         }
     }
 
+    
+    /* Search for local name */        
+    if (get_complete_local_name(disc->data, disc->length_data, local_name, sizeof(local_name))) {
+        ESP_LOGI(tag, "Complete Local Name: %s", local_name);
+    }
+
+    if (strncmp(local_name, CONFIG_EXAMPLE_LOCAL_NAME, strlen(CONFIG_EXAMPLE_LOCAL_NAME)) == 0) {
+        ESP_LOGI(tag, "Local name match target name: %s", CONFIG_EXAMPLE_LOCAL_NAME);
+        return 1;
+    }
     /* The device has to advertise support for the Alert Notification
     * service (0x1811).
     */
-    do {
-        ad_struct_len = disc->data[offset];
+    // do {
+    //     ad_struct_len = disc->data[offset];
 
-        if (!ad_struct_len) {
-            break;
-        }
+    //     if (!ad_struct_len) {
+    //         break;
+    //     }
 
-        /* Search for local name */        
-        if (get_complete_local_name(disc->data, disc->length_data, local_name, sizeof(local_name))) {
-            ESP_LOGI(tag, "Complete Local Name: %s", local_name);
-        }
+	// /* Search if ANS UUID is advertised */
+    //     if (disc->data[offset] == 0x03 && disc->data[offset + 1] == 0x03) {
+    //         if ( disc->data[offset + 2] == 0x18 && disc->data[offset + 3] == 0x11 ) {
+    //             return 1;
+    //         }
+    //     }
 
-        if (strncmp(local_name, CONFIG_EXAMPLE_LOCAL_NAME, strlen(CONFIG_EXAMPLE_LOCAL_NAME)) == 0) {
-            ESP_LOGI(tag, "Local name match target name: %s", CONFIG_EXAMPLE_LOCAL_NAME);
-                return 1;
-            }
-	/* Search if ANS UUID is advertised */
-        // if (disc->data[offset] == 0x03 && disc->data[offset + 1] == 0x03) {
-        //     if ( disc->data[offset + 2] == 0x18 && disc->data[offset + 3] == 0x11 ) {
-        //         return 1;
-        //     }
-        // }
+    //     offset += ad_struct_len + 1;
 
-        offset += ad_struct_len + 1;
-
-     } while ( offset < disc->length_data );
+    //  } while ( offset < disc->length_data );
 
     return 0;
 }
@@ -752,6 +620,7 @@ blecent_connect_if_interesting(void *disc)
     }
 #endif
 
+    ESP_LOGI(tag, "Device found interesting, initiating connection");
 #if !(MYNEWT_VAL(BLE_HOST_ALLOW_CONNECT_WITH_SCAN))
     /* Scanning must be stopped before a connection can be initiated. */
     rc = ble_gap_disc_cancel();
@@ -973,6 +842,10 @@ blecent_gap_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_NOTIFY_RX:
         /* Peer sent us a notification or indication. */
+        uint8_t data[256];
+        uint16_t len = OS_MBUF_PKTLEN(event->notify_rx.om);
+
+        os_mbuf_copydata(event->notify_rx.om, 0, len, data);
         MODLOG_DFLT(INFO, "received %s; conn_handle=%d attr_handle=%d "
                     "attr_len=%d\n",
                     event->notify_rx.indication ?
@@ -981,9 +854,75 @@ blecent_gap_event(struct ble_gap_event *event, void *arg)
                     event->notify_rx.conn_handle,
                     event->notify_rx.attr_handle,
                     OS_MBUF_PKTLEN(event->notify_rx.om));
+        ESP_LOG_BUFFER_HEX(tag, data, len);
+
+        if (event->notify_rx.attr_handle == 62) { // FFC5
+
+            uint8_t cmd = data[0];
+
+            switch (cmd) {
+
+            case 0x01: // GET_BLOCK_SIZE response
+
+                if (len >= 3) {
+
+                    g_block_size = data[1] | (data[2] << 8);
+
+                    ESP_LOGI(tag,
+                            "Block Size = %u",
+                            g_block_size);
+
+                    send_image_identify(event->notify_rx.conn_handle);    // <-- write FFC1
+                    g_oad_state = OAD_STATE_WAIT_IMAGE_ACCEPT;
+                }
+                break;
+
+            case 0x12: // Block request
+
+                handle_block_request(data, len);
+                break;
+
+            default:
+                ESP_LOGW(tag,
+                        "Unknown OAD CTRL cmd 0x%02X",
+                        cmd);
+                break;
+            }
+        }
+        else if (event->notify_rx.attr_handle == 54) { // FFC1
+
+            if (g_oad_state == OAD_STATE_WAIT_IMAGE_ACCEPT) {
+
+                if (len >= 1 && data[0] == 0x00) {
+
+                    ESP_LOGI(tag, "Image accepted");
+
+                    send_start_oad(event->notify_rx.conn_handle);      // write 0x03 to FFC5
+                    g_oad_state = OAD_STATE_WAIT_BLOCK_REQ;
+                }
+                else {
+
+                    ESP_LOGE(tag,
+                            "Image rejected code=0x%02X",
+                            data[0]);
+                }
+            }
+        }
 
         /* Attribute data is contained in event->notify_rx.om. Use
          * `os_mbuf_copydata` to copy the data received in notification mbuf */
+        return 0;
+
+    case BLE_GAP_EVENT_SUBSCRIBE:
+        /* Peer subscribed or unsubscribed to notifications or indications for
+         * the specified attribute handle. */
+        ESP_LOGI(tag, "subscribe event; conn_handle=%d attr_handle=%d "
+                    "reason=%d prev=%d cur=%d\n",
+                    event->subscribe.conn_handle,
+                    event->subscribe.attr_handle,
+                    event->subscribe.reason,
+                    event->subscribe.prev_notify,
+                    event->subscribe.cur_notify);
         return 0;
 
     case BLE_GAP_EVENT_MTU:
@@ -1014,11 +953,11 @@ blecent_gap_event(struct ble_gap_event *event, void *arg)
         /* An advertisement report was received during GAP discovery. */
         /* Filter devices by RSSI */
         if (event->ext_disc.rssi > -50){
-        ESP_LOGI(tag, "Device: %s , RSSI: %d", addr_str(event->ext_disc.addr.val), event->ext_disc.rssi);
+            ESP_LOGI(tag, "Device: %s , RSSI: %d", addr_str(event->ext_disc.addr.val), event->ext_disc.rssi);
 
-        ext_print_adv_report(&event->ext_disc);
+            ext_print_adv_report(&event->ext_disc);
 
-        blecent_connect_if_interesting(&event->ext_disc);
+            blecent_connect_if_interesting(&event->ext_disc);
         }
         return 0;
 #endif
