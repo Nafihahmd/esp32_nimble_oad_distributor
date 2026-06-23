@@ -96,6 +96,135 @@ uint8_t image_identify[] = {
     0x00,0x00,0x00,0x00
 };
 /**
+ * Send command for the target to restart to the new firmware
+ */
+static void send_finish_oad(uint16_t conn_handle)
+{
+    const struct peer *peer = peer_find(conn_handle);
+    const struct peer_chr *ctrl_chr;
+
+    ctrl_chr = peer_chr_find_uuid(peer,
+                                  &oad_service_uuid.u,
+                                  &oad_ctrl_uuid.u);
+
+    if (ctrl_chr == NULL) {
+        ESP_LOGE(tag, "OAD Control characteristic not found");
+        return;
+    }
+
+    uint8_t cmd = CMD_FINISH_OAD;
+
+    int rc = ble_gattc_write_no_rsp_flat(conn_handle,
+                                         ctrl_chr->chr.val_handle,
+                                         &cmd,
+                                         sizeof(cmd));
+
+    ESP_LOGI(tag, "OAD Finished rc=%d", rc);
+}
+/**
+ * Build OAD blocks from the firmware.bin file
+ */
+static uint16_t build_oad_block(uint32_t block_num,
+                                uint8_t *tx_buf)
+{
+    uint32_t payload_size = g_block_size - 4;
+
+    uint32_t offset = block_num * payload_size;
+
+    uint32_t remaining =
+        (offset < g_image_size)
+            ? (g_image_size - offset)
+            : 0;
+
+    uint32_t data_len =
+        (remaining > payload_size)
+            ? payload_size
+            : remaining;
+
+    /* Block number */
+    tx_buf[0] = (uint8_t)(block_num);
+    tx_buf[1] = (uint8_t)(block_num >> 8);
+    tx_buf[2] = (uint8_t)(block_num >> 16);
+    tx_buf[3] = (uint8_t)(block_num >> 24);
+
+    memcpy(&tx_buf[4],
+           &g_image_data[offset],
+           data_len);
+
+    /* Pad last block with FF */
+    if (data_len < payload_size) {
+
+        memset(&tx_buf[4 + data_len],
+               0xFF,
+               payload_size - data_len);
+    }
+    
+    if (block_num>1022){
+        ESP_LOGI(tag,
+         "block=%lu offset=%lu remaining=%lu data_len=%lu",
+         block_num,
+         offset,
+         remaining,
+         data_len);
+    }
+
+    return g_block_size;
+}
+/**
+ * Send OAD blocks as requested by target
+ */
+static uint8_t g_tx_block[244];
+
+static void send_oad_block(uint16_t conn_handle,
+                           uint32_t block_num)
+{
+    const struct peer *peer;
+    const struct peer_chr *block_chr;
+
+    peer = peer_find(conn_handle);
+
+    block_chr = peer_chr_find_uuid(peer,
+                                   &oad_service_uuid.u,
+                                   &oad_block_uuid.u);
+
+    if (block_chr == NULL) {
+        ESP_LOGE(tag,
+                 "OAD Block characteristic not found");
+        return;
+    }
+
+    uint16_t tx_len =
+        build_oad_block(block_num,
+                        g_tx_block);
+
+    ESP_LOGD(tag,
+             "TX block=%lu offset=%lu len=%u first8=%02x%02x%02x%02x%02x%02x%02x%02x",
+             (unsigned long)block_num,
+             (unsigned long)(block_num * (g_block_size - 4)),
+             tx_len - 4,
+             g_tx_block[0],
+             g_tx_block[1],
+             g_tx_block[2],
+             g_tx_block[3],
+             g_tx_block[4],
+             g_tx_block[5],
+             g_tx_block[6],
+             g_tx_block[7]);
+
+    int rc =
+        ble_gattc_write_no_rsp_flat(conn_handle,
+                                    block_chr->chr.val_handle,
+                                    g_tx_block,
+                                    tx_len);
+
+    if (rc != 0) {
+        ESP_LOGE(tag,
+                 "Failed to send block %lu rc=%d",
+                 (unsigned long)block_num,
+                 rc);
+    }
+}
+/**
  * Send OAD start command to target. The target will respond
  * by requesting block number.
  */
@@ -166,7 +295,7 @@ static void send_image_identify(uint16_t conn_handle)
 /**
  * Handle Block request send by Target
  */
-static void handle_block_request(uint8_t *data, uint16_t len)
+static void handle_block_request(uint16_t conn_handle, uint8_t *data, uint16_t len)
 {
     uint8_t status = data[1];
 
@@ -188,7 +317,7 @@ static void handle_block_request(uint8_t *data, uint16_t len)
              "Request Block %lu",
              (unsigned long)block_num);
 
-    // send_oad_block(block_num);
+    send_oad_block(conn_handle, block_num);
 }
 #if MYNEWT_VAL(BLE_GATTC)
 static int
@@ -846,15 +975,15 @@ blecent_gap_event(struct ble_gap_event *event, void *arg)
         uint16_t len = OS_MBUF_PKTLEN(event->notify_rx.om);
 
         os_mbuf_copydata(event->notify_rx.om, 0, len, data);
-        MODLOG_DFLT(INFO, "received %s; conn_handle=%d attr_handle=%d "
-                    "attr_len=%d\n",
-                    event->notify_rx.indication ?
-                    "indication" :
-                    "notification",
-                    event->notify_rx.conn_handle,
-                    event->notify_rx.attr_handle,
-                    OS_MBUF_PKTLEN(event->notify_rx.om));
-        ESP_LOG_BUFFER_HEX(tag, data, len);
+        // MODLOG_DFLT(INFO, "received %s; conn_handle=%d attr_handle=%d "
+        //             "attr_len=%d\n",
+        //             event->notify_rx.indication ?
+        //             "indication" :
+        //             "notification",
+        //             event->notify_rx.conn_handle,
+        //             event->notify_rx.attr_handle,
+        //             OS_MBUF_PKTLEN(event->notify_rx.om));
+        // ESP_LOG_BUFFER_HEX(tag, data, len);
 
         if (event->notify_rx.attr_handle == 62) { // FFC5
 
@@ -867,20 +996,66 @@ blecent_gap_event(struct ble_gap_event *event, void *arg)
                 if (len >= 3) {
 
                     g_block_size = data[1] | (data[2] << 8);
+                    uint32_t image_payload_size = g_block_size - 4;
 
-                    ESP_LOGI(tag,
-                            "Block Size = %u",
-                            g_block_size);
+                    g_total_blocks =
+                        (g_image_size + image_payload_size - 1)
+                        / image_payload_size;
+
+                    ESP_LOGD(tag,
+                        "BlockSize=%u Payload=%lu TotalBlocks=%lu",
+                        g_block_size,
+                        (unsigned long)image_payload_size,
+                        (unsigned long)g_total_blocks);
 
                     send_image_identify(event->notify_rx.conn_handle);    // <-- write FFC1
                     g_oad_state = OAD_STATE_WAIT_IMAGE_ACCEPT;
                 }
                 break;
 
-            case 0x12: // Block request
+            case 0x04:
 
-                handle_block_request(data, len);
+                if (len >= 2) {
+
+                    uint8_t status = data[1];
+
+                    if (status == 0x00) {
+
+                        ESP_LOGI(tag,
+                                "OAD Finish acknowledged");
+
+                        g_oad_state = OAD_STATE_IDLE;
+                    }
+                    else {
+
+                        ESP_LOGE(tag,
+                                "OAD Finish failed status=0x%02X",
+                                status);
+                    }
+                }
                 break;
+
+            case 0x12:
+            {
+                uint8_t status = data[1];
+
+                if (status == 0x00) {
+                    handle_block_request(event->notify_rx.conn_handle, data, len);
+                }
+                else if (status == 0x0E) {
+
+                    ESP_LOGI(tag,
+                            "Download complete, sending FINISH_OAD");
+
+                    send_finish_oad(event->notify_rx.conn_handle);
+                }
+                else {
+                    ESP_LOGW(tag,
+                            "Unhandled OAD status 0x%02X",
+                            status);
+                }
+                break;
+            }
 
             default:
                 ESP_LOGW(tag,
@@ -913,17 +1088,6 @@ blecent_gap_event(struct ble_gap_event *event, void *arg)
          * `os_mbuf_copydata` to copy the data received in notification mbuf */
         return 0;
 
-    case BLE_GAP_EVENT_SUBSCRIBE:
-        /* Peer subscribed or unsubscribed to notifications or indications for
-         * the specified attribute handle. */
-        ESP_LOGI(tag, "subscribe event; conn_handle=%d attr_handle=%d "
-                    "reason=%d prev=%d cur=%d\n",
-                    event->subscribe.conn_handle,
-                    event->subscribe.attr_handle,
-                    event->subscribe.reason,
-                    event->subscribe.prev_notify,
-                    event->subscribe.cur_notify);
-        return 0;
 
     case BLE_GAP_EVENT_MTU:
         MODLOG_DFLT(INFO, "mtu update event; conn_handle=%d cid=%d mtu=%d\n",
@@ -1117,5 +1281,11 @@ app_main(void)
         cids[i] = 0;
     }
 #endif
+    g_image_data = firmware_bin_start;
+    g_image_size = firmware_bin_end - firmware_bin_start;
+
+    ESP_LOGI(tag,
+            "Image Size = %lu bytes",
+            (unsigned long)g_image_size);
 
 }
