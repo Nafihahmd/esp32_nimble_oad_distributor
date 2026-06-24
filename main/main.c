@@ -848,12 +848,30 @@ blecent_gap_event(struct ble_gap_event *event, void *arg)
         blecent_connect_if_interesting(&event->disc);
 
         return 0;
+    case BLE_GAP_EVENT_CONN_UPDATE:
+        struct ble_gap_conn_desc desc;
+
+        ble_gap_conn_find(event->conn_update.conn_handle, &desc);
+        ESP_LOGI(tag,
+                "Conn interval=%u units",
+                desc.conn_itvl);
+        
+        return 0;
+        
 #if NIMBLE_BLE_CONNECT
     case BLE_GAP_EVENT_CONNECT:
         /* A new connection was established or a connection attempt failed. */
         if (event->connect.status == 0) {
             /* Connection successfully established. */
             MODLOG_DFLT(INFO, "Connection established ");
+            struct ble_gap_upd_params params = {
+                .itvl_min = 6,
+                .itvl_max = 8,
+                .latency = 0,
+                .supervision_timeout = 500,
+            };
+
+            ble_gap_update_params(event->connect.conn_handle, &params);
 
             rc = ble_gap_conn_find(event->connect.conn_handle, &desc);
             assert(rc == 0);
